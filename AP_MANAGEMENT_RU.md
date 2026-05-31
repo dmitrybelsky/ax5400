@@ -283,7 +283,7 @@ reboot
 |----------|--------------------------|
 | **802.11r (FT)** | ✅ работает — раздел 4 (UCI с `ap_macaddr`/`nasid`) |
 | **802.11v BTM** (`bss_transition=1`) | ✅ работает — точка «подсказывает» клиенту уйти |
-| **802.11k** (neighbor report) | ❌ генератор не выставляет `rrm_neighbor_report`, поэтому `hostapd_cli set_neighbor`/`show_neighbor` → `FAIL` (база соседей выключена) |
+| **802.11k** (neighbor report) | ✅ работает, но не из UCI: генератор не выставляет `rrm_neighbor_report` → надо дописать в конфиг и перечитать BSS через `wpa_cli -g` (раздел 8) |
 | **disassoc_low_ack / RSSI-kick** | ⚠️ UCI-опции не пробрасываются; `disassoc_low_ack` у hostapd включён по умолчанию, но порога по RSSI нет |
 | **Band steering** (5↔2.4) | ❌ нативно нет; нужен демон (`dawn`/`usteer`), а его не поставить — корневая ФС занята на 100%, репозиториев под прошивку нет |
 
@@ -294,8 +294,8 @@ reboot
 
 ### 7. Активный стиринг sticky-клиентов («mini-usteer» на штатных средствах)
 
-802.11k недоступен (`set_neighbor` → `FAIL`), но **802.11v BTM работает**: `bss_tm_req`
-возвращает `OK` и сам несёт клиенту кандидатов-соседей. RSSI клиента берётся из
+**802.11v BTM работает** «из коробки»: `bss_tm_req` возвращает `OK` и сам несёт клиенту
+кандидатов-соседей (802.11k можно включить дополнительно — раздел 8). RSSI клиента берётся из
 `iwinfo <iface> assoclist` (hostapd отдаёт `signal=0`). Этого достаточно для watchdog,
 который «подталкивает» далёкого клиента на ближнюю точку (решение принимает клиент;
 с активным 802.11r переход бесшовный).
@@ -334,6 +334,51 @@ ps w | grep -v grep | grep -q roam_assist.sh || /data/roam_assist.sh >/dev/null 
 > Подбирайте `THRESH` под объект: слишком высоко (напр. −70) → клиенты «пинг-понгуют»;
 > слишком низко (−85) → держатся за дальнюю точку. −78 dBm — разумная отправная точка.
 > Кандидатов лучше задавать той же полосы (5 ГГц → 5 ГГц соседи), чтобы не гонять с 5 на 2.4.
+
+### 8. 802.11k (neighbor report) — через `wpa_cli` reload
+
+Генератор не выставляет `rrm_neighbor_report`, а `/lib` — read-only squashfs (не
+отредактировать). Поэтому 802.11k включается **пост-загрузочным патчем**: дописать
+параметр в `/var/run` конфиг и перечитать BSS **родным механизмом прошивки** —
+`wpa_cli -g /var/run/hostapd/global raw ADD/REMOVE bss_config=...` (именно так wifi-скрипт
+добавляет BSS, см. `/lib/wifi/hostapd.sh`). `hostapd_cli -g` в этом билде не поддержан, а
+`HUP`/`disable`/`enable` параметр не перечитывают — нужен именно `wpa_cli -g raw`.
+
+```sh
+#!/bin/sh
+# /data/dot11k.sh — включить 802.11k + прописать список соседей.
+# @reboot (sleep 20 ждёт поднятия wifi).  Немедленно: /data/dot11k.sh now
+[ "$1" = now ] || sleep 20
+G=/var/run/hostapd/global
+SSIDHEX=$(echo -n 'MyNetwork' | hexdump -ve '1/1 "%02x"')   # ваш SSID в hex
+for ifc in wl0 wl1; do
+  conf=/var/run/hostapd-$ifc.conf; [ -f "$conf" ] || continue
+  grep -q '^rrm_neighbor_report=1' "$conf" || printf 'rrm_neighbor_report=1\nrrm_beacon_report=1\n' >> "$conf"
+  wpa_cli -g $G raw REMOVE $ifc >/dev/null 2>&1      # снять BSS (кратко уронит клиентов)
+  sleep 1
+  wpa_cli -g $G raw ADD bss_config=$ifc:$conf >/dev/null 2>&1   # поднять, читая патч
+done
+sleep 2
+C5=/var/run/hostapd-wifi1   # wl0 (ctrl-пути инвертированы)
+C2=/var/run/hostapd-wifi0   # wl1
+# nr = <bssid_nocolon><bssid_info=00000000><opclass><chan><phy>
+#   opclass: 2.4=51(81)  5G/36-48=73(115)  5G/149-165=7d(125);  phy: HT=07 VHT=08
+add() { hostapd_cli -p $C5 -i wl0 set_neighbor $1 ssid=$SSIDHEX nr=$2 >/dev/null 2>&1
+        hostapd_cli -p $C2 -i wl1 set_neighbor $1 ssid=$SSIDHEX nr=$2 >/dev/null 2>&1; }
+add AA:AA:AA:AA:AA:A0 aaaaaaaaaaa000000000732408   # AP-1 5G ch36
+add AA:AA:AA:AA:AA:A1 aaaaaaaaaaa100000000510107   # AP-1 2.4 ch1
+add BB:BB:BB:BB:BB:B0 bbbbbbbbbbb000000000732c08   # AP-2 5G ch44
+add CC:CC:CC:CC:CC:C0 ccccccccccc0000000007d9508   # AP-3 5G ch149
+# … все BSSID всех точек обеих полос; self-записи безвредны (hostapd добавит свою сам)
+logger -t dot11k '802.11k enabled'
+```
+
+Проверка: `hostapd_cli -p /var/run/hostapd-wifi1 -i wl0 show_neighbor` — должен вернуть
+список (а не `FAIL`). Персист — `@reboot /data/dot11k.sh &` в crontab.
+
+> **Цена:** на каждой загрузке точки `REMOVE/ADD` кратко (~1–2 c) роняет оба BSS —
+> клиенты сразу возвращаются (с FT бесшовно). НЕ кладите запуск в ежеминутный watchdog
+> `fix_ssh.sh` — только `@reboot`, иначе клиентов будет рвать каждую минуту.
 
 ---
 

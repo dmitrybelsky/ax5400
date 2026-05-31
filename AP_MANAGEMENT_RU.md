@@ -283,13 +283,57 @@ reboot
 |----------|--------------------------|
 | **802.11r (FT)** | ✅ работает — раздел 4 (UCI с `ap_macaddr`/`nasid`) |
 | **802.11v BTM** (`bss_transition=1`) | ✅ работает — точка «подсказывает» клиенту уйти |
-| **802.11k** (neighbor report) | ⚠️ генератор игнорирует `rrm_neighbor_report` — в конфиг не попадает |
+| **802.11k** (neighbor report) | ❌ генератор не выставляет `rrm_neighbor_report`, поэтому `hostapd_cli set_neighbor`/`show_neighbor` → `FAIL` (база соседей выключена) |
 | **disassoc_low_ack / RSSI-kick** | ⚠️ UCI-опции не пробрасываются; `disassoc_low_ack` у hostapd включён по умолчанию, но порога по RSSI нет |
 | **Band steering** (5↔2.4) | ❌ нативно нет; нужен демон (`dawn`/`usteer`), а его не поставить — корневая ФС занята на 100%, репозиториев под прошивку нет |
 
 Практический вывод: роуминг на стоке держится на **802.11r + 802.11v** плюс грамотной
 радиопланировке (разные каналы, HE20 на 2.4 ГГц, при необходимости — снижение мощности
-для чётких границ сот). Sticky-client и band steering без сторонних пакетов не закрываются.
+для чётких границ сот). Полноценный `usteer`/`dawn` не поставить, но активный стиринг
+«прилипших» клиентов реально собрать на штатных `iwinfo` + `bss_tm_req` — см. ниже.
+
+### 7. Активный стиринг sticky-клиентов («mini-usteer» на штатных средствах)
+
+802.11k недоступен (`set_neighbor` → `FAIL`), но **802.11v BTM работает**: `bss_tm_req`
+возвращает `OK` и сам несёт клиенту кандидатов-соседей. RSSI клиента берётся из
+`iwinfo <iface> assoclist` (hostapd отдаёт `signal=0`). Этого достаточно для watchdog,
+который «подталкивает» далёкого клиента на ближнюю точку (решение принимает клиент;
+с активным 802.11r переход бесшовный).
+
+```sh
+#!/bin/sh
+# /data/roam_assist.sh — мягкий 802.11v BTM-стиринг. @reboot + keep-alive в fix_ssh.sh.
+THRESH=-78; COOLDOWN=60; INTERVAL=15
+C5=/var/run/hostapd-wifi1   # wl0 = 5 ГГц (ctrl-пути инвертированы!)
+C2=/var/run/hostapd-wifi0   # wl1 = 2.4 ГГц
+STATE=/tmp/roam_state; mkdir -p $STATE
+# Кандидаты = ДРУГИЕ точки той же полосы: neighbor=<bssid>,<bssid_info>,<opclass>,<chan>,<phy>
+# opclass: 2.4ГГц=81, 5ГГц UNII-1(36-48)=115, UNII-3(149-165)=125;  phy: HT=7, VHT=8
+CAND5="neighbor=AA:AA:AA:AA:AA:A0,0,115,44,8 neighbor=BB:BB:BB:BB:BB:B0,0,125,149,8"
+CAND2="neighbor=AA:AA:AA:AA:AA:A1,0,81,6,7 neighbor=BB:BB:BB:BB:BB:B1,0,81,11,7"
+steer() { # ctrl iface mac cands
+  [ -z "$4" ] && return
+  now=$(date +%s); f=$STATE/$(echo $3|tr : _); last=$(cat $f 2>/dev/null||echo 0)
+  [ $((now-last)) -lt $COOLDOWN ] && return
+  hostapd_cli -p $1 -i $2 bss_tm_req $3 pref=1 $4 >/dev/null 2>&1   # disassoc_imminent=0 → мягко
+  echo $now > $f; logger -t roam_assist "BTM nudge $3 on $2"
+}
+band() { # ctrl iface cands
+  iwinfo $2 assoclist 2>/dev/null | awk '/^([0-9A-Fa-f]{2}:){5}/{mac=$1; for(i=2;i<=NF;i++) if($i ~ /^-[0-9]+$/ && $(i+1)=="dBm"){print mac,$i; break}}' | \
+  while read mac sig; do [ -n "$sig" ] && [ "$sig" -le "$THRESH" ] && steer "$1" "$2" "$mac" "$3"; done
+}
+while :; do band "$C5" wl0 "$CAND5"; band "$C2" wl1 "$CAND2"; sleep $INTERVAL; done
+```
+
+Персистентность: `@reboot /data/roam_assist.sh &` в crontab + keep-alive в `/data/fix_ssh.sh`:
+
+```sh
+ps w | grep -v grep | grep -q roam_assist.sh || /data/roam_assist.sh >/dev/null 2>&1 &
+```
+
+> Подбирайте `THRESH` под объект: слишком высоко (напр. −70) → клиенты «пинг-понгуют»;
+> слишком низко (−85) → держатся за дальнюю точку. −78 dBm — разумная отправная точка.
+> Кандидатов лучше задавать той же полосы (5 ГГц → 5 ГГц соседи), чтобы не гонять с 5 на 2.4.
 
 ---
 
@@ -339,10 +383,18 @@ ntpd -q -n -p 192.168.1.1 -p 0.ru.pool.ntp.org     # разовая принуд
 
 - **Главное — на L2-магистрали (роутер-шлюз).** На MikroTik: `/interface bridge set
   bridge igmp-snooping=yes` (RouterOS 7.x поднимает и querier сам).
-- На самой точке ядро snooping поддерживает (`…/br-lan/bridge/multicast_snooping`,
-  UCI `network.lan.igmp_snooping`), но мост AP мостит только её локальные порты.
+- На самой точке ядро snooping поддерживает; включается одной строкой (эффект — на
+  локальных портах моста точки):
+
+  ```sh
+  echo 1 > /sys/devices/virtual/net/br-lan/bridge/multicast_snooping
+  # персист (ramfs обнуляется): добавить эту же строку в /data/fix_ssh.sh
+  ```
 - **Без IGMP-querier на шлюзе snooping может «отрезать» мультикаст** (мост решит, что
-  подписчиков нет). Включать согласованно: querier на шлюзе + snooping.
+  подписчиков нет). Включать согласованно: querier на шлюзе + snooping. На MikroTik
+  `igmp-snooping=yes` поднимает querier сам — проверить: `/interface bridge print detail`
+  (`querier=yes`). Link-local мультикаст (224.0.0.0/24, в т.ч. mDNS/Bonjour) snooping
+  не трогает — он всегда флудится, так что AirPlay/Chromecast/HomeKit-дискавери не страдают.
 
 ---
 

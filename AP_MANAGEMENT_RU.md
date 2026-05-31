@@ -256,6 +256,94 @@ grep -m1 ^r0kh /var/run/hostapd-wl0.conf
 > static-lease по MAC точки — иначе DHCP может выдать тот же адрес другому клиенту
 > (классический симптом: `ping` адреса то отвечает, то нет, ARP «прыгает» между MAC).
 
+### 5. Ширина канала на 802.11ax (важно: `HE20`, а не `HT20`)
+
+Радио здесь работают в режиме 11ax (`hwmode=11axg`/`11axa`). Генератор конфига берёт
+ширину из `htmode`, но **для HE-режима ждёт значения `HE20`/`HE40`/`HE80`/`HE160`** —
+не `HT20`/`HT40`. Если задать `htmode=HT20`, генератор всё равно впишет `ht_capab=…[HT40+]`,
+и 2.4 ГГц останется на 40 МГц.
+
+```sh
+# Сузить 2.4 ГГц до 20 МГц (рекомендуется при 3 AP на каналах 1/6/11 —
+# иначе HT40 перекрывает соседние каналы и точки мешают друг другу)
+uci set wireless.wifi0.htmode='HE20'
+uci set wireless.wifi0.bw='20'
+uci commit wireless
+reboot
+# Проверка:  iw dev wl1 info | grep width   →  width: 20 MHz
+```
+
+> 5 ГГц: непересекающихся 80-МГц блоков без DFS всего два (UNII-1: 36–48 и UNII-3:
+> 149–165). При трёх AP две нижние точки на 5 ГГц всё равно делят 36–48 — это нормально;
+> DFS-каналы (52–64, 100+) прошивка при старте блокирует.
+
+### 6. Тюнинг роуминга: что работает, а что нет
+
+| Механизм | Статус на этой прошивке |
+|----------|--------------------------|
+| **802.11r (FT)** | ✅ работает — раздел 4 (UCI с `ap_macaddr`/`nasid`) |
+| **802.11v BTM** (`bss_transition=1`) | ✅ работает — точка «подсказывает» клиенту уйти |
+| **802.11k** (neighbor report) | ⚠️ генератор игнорирует `rrm_neighbor_report` — в конфиг не попадает |
+| **disassoc_low_ack / RSSI-kick** | ⚠️ UCI-опции не пробрасываются; `disassoc_low_ack` у hostapd включён по умолчанию, но порога по RSSI нет |
+| **Band steering** (5↔2.4) | ❌ нативно нет; нужен демон (`dawn`/`usteer`), а его не поставить — корневая ФС занята на 100%, репозиториев под прошивку нет |
+
+Практический вывод: роуминг на стоке держится на **802.11r + 802.11v** плюс грамотной
+радиопланировке (разные каналы, HE20 на 2.4 ГГц, при необходимости — снижение мощности
+для чётких границ сот). Sticky-client и band steering без сторонних пакетов не закрываются.
+
+---
+
+## Эксплуатационная закалка (чтобы конфиг пережил недели)
+
+### Отключить автообновление прошивки (OTA)
+
+Прошивка по cron ежедневно дёргает `otapredownload` — апдейт может **снести root, SSH и
+всю конфигурацию**. Для рутованного сетапа OTA нужно глушить:
+
+```sh
+crontab -l | grep -v otapredownload | crontab -
+# Самовосстановление в /data/fix_ssh.sh (cron @reboot + ежеминутно):
+crontab -l 2>/dev/null | grep -q otapredownload && crontab -l | grep -v otapredownload | crontab -
+```
+
+### Починить системное время (dumb AP сам не синхронизируется)
+
+У точки в режиме dumb-AP нет шлюза и DNS (только статический IP), поэтому `ntpd` не
+достучится до серверов, и часы «висят» на заводской дате (ломает TLS-валидацию и таймеры
+ключей WPA, путает логи).
+
+```sh
+uci set system.@system[0].timezone='MSK-3'         # пример — Москва
+uci set system.@system[0].zonename='Europe/Moscow'
+uci -q delete system.ntp.server
+uci add_list system.ntp.server='0.ru.pool.ntp.org'
+uci add_list system.ntp.server='pool.ntp.org'
+uci commit system
+
+# Маршрут/DNS/таймзону держать в /data/fix_ssh.sh (ramfs /etc обнуляется при ребуте):
+ip route | grep -q '^default' || ip route add default via 192.168.1.1
+grep -q 'nameserver 192.168.1.1' /etc/resolv.conf || echo 'nameserver 192.168.1.1' > /etc/resolv.conf
+echo 'MSK-3' > /etc/TZ
+
+ntpd -q -n -p 192.168.1.1 -p 0.ru.pool.ntp.org     # разовая принудительная синхронизация
+```
+
+> `/etc` — ramfs (обнуляется при перезагрузке), поэтому `/etc/resolv.conf`, `/etc/TZ` и
+> default-route нужно восстанавливать из `/data/fix_ssh.sh` (основной IP точки —
+> 192.168.31.1, поэтому маршрут в persistent-конфиге не лежит).
+
+## IGMP snooping (мультикаст: IPTV, DLNA, mDNS)
+
+По умолчанию мост рассылает мультикаст во все порты и всем Wi-Fi клиентам (на низкой
+скорости — «съедает» эфир). Snooping ограничивает рассылку только подписчиками.
+
+- **Главное — на L2-магистрали (роутер-шлюз).** На MikroTik: `/interface bridge set
+  bridge igmp-snooping=yes` (RouterOS 7.x поднимает и querier сам).
+- На самой точке ядро snooping поддерживает (`…/br-lan/bridge/multicast_snooping`,
+  UCI `network.lan.igmp_snooping`), но мост AP мостит только её локальные порты.
+- **Без IGMP-querier на шлюзе snooping может «отрезать» мультикаст** (мост решит, что
+  подписчиков нет). Включать согласованно: querier на шлюзе + snooping.
+
 ---
 
 ## Что открывается с SSH-доступом

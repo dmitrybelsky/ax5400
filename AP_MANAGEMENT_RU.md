@@ -379,6 +379,69 @@ logger -t dot11k '802.11k enabled'
 > **Цена:** на каждой загрузке точки `REMOVE/ADD` кратко (~1–2 c) роняет оба BSS —
 > клиенты сразу возвращаются (с FT бесшовно). НЕ кладите запуск в ежеминутный watchdog
 > `fix_ssh.sh` — только `@reboot`, иначе клиентов будет рвать каждую минуту.
+>
+> **Грабли 1 — тайминг.** Wifi на этой прошивке поднимается медленно (~90–140 c). Если
+> `dot11k` сделает `REMOVE/ADD` слишком рано, BSS «вылетит» из global hostapd
+> (`wpa_cli INTERFACES` покажет только служебный `wl13`) — точка перестанет обслуживать
+> клиентов. Поэтому: `sleep 90` в начале + **гард готовности** (ждать, пока `wl0` И `wl1`
+> появятся в `wpa_cli -g … raw INTERFACES`) + при сбое — `exit 0` БЕЗ изменений. Фолбэк,
+> если после ребута соседей `0`: запустить вручную `/data/dot11k.sh now`.
+>
+> **Грабли 2 — `qos_map_set` ломает ADD.** НЕ добавляйте `qos_map_set` в конфиг этим путём:
+> парсер hostapd при `ADD` его отвергает и **роняет весь BSS**. Только `rrm_neighbor_report`
+> безопасен для inject.
+
+---
+
+## Аудит опций генератора: что включается, а что ломает
+
+`/lib/wifi/hostapd.sh` принимает ~140 UCI-опций и умеет вывести ~180 hostapd-ключей. Но
+**поддержка опции в генераторе ≠ её можно включить.** На практике опции делятся на 3 класса:
+
+| Класс | Поведение | Примеры |
+|-------|-----------|---------|
+| **1. Проходят через UCI** | `uci set … && reboot` → в конфиге, работает | `wps_pbc`, `bss_load_update_period`, `wnm_sleep_mode`, `he_bsscolor`, `disassoc_low_ack`* |
+| **2. Гейтятся условием** | эмитятся только при включённой фиче (Hotspot 2.0/interworking) | `qos_map_set`, `gas_frag_limit`, `anqp_*`, `hs20_*` |
+| **3. Игнорируются / ломают** | UCI не выводит; ручной inject через `wpa_cli` либо бесполезен, либо валит BSS | `rrm_neighbor_report` (нужен inject — раздел 8), **`qos_map_set` (inject ломает ADD!)** |
+
+\* `disassoc_low_ack` у hostapd включён по умолчанию, отдельная UCI-опция игнорируется.
+
+**Только эмпирическая проверка** на живой точке (после `reboot`: смотреть `/var/run/hostapd-*.conf`
+и `wpa_cli INTERFACES`) показывает, в какой класс попала опция.
+
+### Полезные опции, проверенные рабочими (класс 1)
+
+```sh
+# Безопасность: ВЫКЛЮЧИТЬ WPS (на dumb-AP включён по умолчанию — лишняя поверхность атаки)
+uci set wireless.@wifi-iface[0].wps_pbc='0'
+uci set wireless.@wifi-iface[1].wps_pbc='0'
+
+# 802.11ax BSS Coloring — РАЗНЫЙ цвет на соседних точках (меньше co-channel interference)
+uci set wireless.wifi0.he_bsscolor='1'   # AP-1: 1/2, AP-2: 3/4, AP-3: 5/6 …
+uci set wireless.wifi1.he_bsscolor='2'
+
+# BSS Load element — точка анонсирует загрузку, клиент при роуминге выбирает менее занятую
+uci set wireless.@wifi-iface[0].bss_load_update_period='60'
+uci set wireless.@wifi-iface[1].bss_load_update_period='60'
+
+# 802.11v WNM Sleep — экономия батареи клиентов
+uci set wireless.@wifi-iface[0].wnm_sleep_mode='1'
+uci set wireless.@wifi-iface[1].wnm_sleep_mode='1'
+uci commit wireless && reboot
+```
+
+> `he_bsscolor`/ATF применяются драйвером при wifi-up и **не читаются обратно** через
+> `iw`/`iwpriv` — проверить можно только сниффером. ATF (`/etc/config/qcawifi` →
+> `atf_mode=1`) — module-load arg; без распределения airtime по SSID даёт лишь базовую «честность».
+
+### Чего НЕТ на этой прошивке
+
+- **QCA-стек стиринга** (`lbd` — Load Balancing Daemon, `hyd` — Hy-Fi mesh): **отсутствует** →
+  нативного band steering нет (обход — `roam_assist.sh` на 802.11v BTM, раздел 7).
+- **EasyMesh / Multi-AP**: hostapd-флаги (`multi_ap`) есть, но **нет контроллера/агента**
+  (1905/prplmesh) → стандартный mesh не поднять.
+- `cab_meshd` — **проприетарный Xiaomi-mesh** (обслуживает скрытый `*_miwifi` SSID), завязан
+  на экосистему Xiaomi; для открытого multi-AP не годится.
 
 ---
 

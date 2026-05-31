@@ -194,45 +194,67 @@ ip addr add 192.168.1.50/24 dev br-lan
 ip addr show br-lan | grep -q 192.168.1.50 || ip addr add 192.168.1.50/24 dev br-lan
 ```
 
-### 4. 802.11r (быстрый роуминг)
+### 4. 802.11r (быстрый роуминг) — через UCI
 
-UCI-параметры для 802.11r на этой прошивке не применяются надёжно.
-Надёжный способ — патчить hostapd-конфиги напрямую после `wifi up`:
+> **Важно (исправление прежней версии этого раздела).**
+> Ранее тут рекомендовалось патчить `/var/run/hostapd-*.conf` и делать `kill -HUP`.
+> На практике это **НЕ активирует FT**: после `HUP` (и после `hostapd_cli ... disable/enable`)
+> hostapd продолжает отдавать обычный `WPA-PSK` — строки `ieee80211r/mobility_domain`
+> попадают в файл, но в эфире Fast Transition не включается.
+>
+> Надёжно FT включается **только через UCI**. Генератор конфига собирает строки
+> `r0kh`/`r1kh`/`nas_identifier`, но MAC для них берёт из **явных полей** `ap_macaddr`/`nasid`.
+> Если их не задать — в конфиг попадает пустой `r0kh=  000102...` (без MAC), и hostapd
+> **отвергает весь BSS** — точка вообще перестаёт выходить в эфир (только скрытый служебный SSID).
+
+Для каждого радио-iface (`wireless.@wifi-iface[0]`, `[1]`):
 
 ```sh
-#!/bin/sh
-# /data/patch_hostapd.sh
-SSID='MyNetwork'
-PASS='mypassword'
-sleep 15   # ждём пока wifi up завершится
-
-for conf in /var/run/hostapd-wl0.conf /var/run/hostapd-wl1.conf; do
-    [ -f "$conf" ] || continue
-    sed -i "s/^ssid=.*/ssid=${SSID}/"                "$conf"
-    sed -i "s/^wpa_passphrase=.*/wpa_passphrase=${PASS}/" "$conf"
-    sed -i "s/wpa_key_mgmt=WPA-PSK.*/wpa_key_mgmt=WPA-PSK FT-PSK/" "$conf"
-    grep -q "mobility_domain=" "$conf" || cat >> "$conf" << 'PARAMS'
-ieee80211r=1
-mobility_domain=1A2B
-ft_psk_generate_local=1
-ft_over_ds=1
-bss_transition=1
-rrm_neighbor_report=1
-rrm_beacon_report=1
-PARAMS
+for idx in 0 1; do
+    dev=$(uci get wireless.@wifi-iface[$idx].device)     # wifi0 (2.4G) / wifi1 (5G)
+    mac=$(uci get wireless.$dev.macaddr)                 # MAC этого радио
+    nasid=$(echo "$mac" | tr -d :)
+    uci set wireless.@wifi-iface[$idx].ieee80211r='1'
+    uci set wireless.@wifi-iface[$idx].mobility_domain='1A2B'   # ОДИНАКОВЫЙ на всех AP
+    uci set wireless.@wifi-iface[$idx].ft_over_ds='1'
+    uci set wireless.@wifi-iface[$idx].nasid="$nasid"           # ключ к рабочему r0kh
+    uci set wireless.@wifi-iface[$idx].ap_macaddr="$mac"        # ключ к рабочему r0kh
+    uci set wireless.@wifi-iface[$idx].nasid2='000000000000'
+    uci set wireless.@wifi-iface[$idx].ap2_macaddr='00:00:00:00:00:00'
+    uci set wireless.@wifi-iface[$idx].ap2_r1_key_holder='00:00:00:00:00:00'
+    uci set wireless.@wifi-iface[$idx].bss_transition='1'       # 802.11v BTM
+    uci set wireless.@wifi-iface[$idx].rrm='1'                  # 802.11k
+    uci set wireless.@wifi-iface[$idx].wnm='1'
 done
-kill -HUP $(pidof hostapd) 2>/dev/null
+uci commit wireless
+reboot   # активируется штатной генерацией при загрузке; «тёплые» рестарты на этой прошивке нестабильны
 ```
 
-Все AP в сети должны использовать **одинаковый** `mobility_domain`.
+SSID, пароль и `mobility_domain` должны **совпадать** на всех AP; каналы — **разные** и непересекающиеся.
+
+**Проверка, что FT реально активен** (а не только лежит в файле):
+
+```sh
+cf=$(grep -h ^ctrl_interface /var/run/hostapd-wl0.conf | cut -d= -f2)
+hostapd_cli -p "$cf" -i wl0 get_config | grep key_mgmt
+# Должно быть:  key_mgmt=WPA-PSK FT-PSK      (а не просто  key_mgmt=WPA-PSK)
+grep -m1 ^r0kh /var/run/hostapd-wl0.conf
+# r0kh должен содержать MAC радио (НЕ пустой), напр.:
+#   r0kh=aa:bb:cc:dd:ee:ff aabbccddeeff 000102030405060708090a0b0c0d0e0f
+# если видите  r0kh=  000102...  (без MAC) — не заданы ap_macaddr/nasid в UCI
+```
 
 ### Пример: три роутера с роумингом без пересечения каналов
 
 | Роутер | 2.4 GHz | 5 GHz | Управление |
 |--------|---------|-------|------------|
-| AP-1 | ch 1 | ch 36 | 192.168.1.100 |
-| AP-2 | ch 6 | ch 44 | 192.168.1.101 |
+| AP-1 | ch 1 | ch 36 | 192.168.1.101 |
+| AP-2 | ch 6 | ch 44 | 192.168.1.102 |
 | AP-3 | ch 11 | ch 149 | 192.168.1.103 |
+
+> Управляющие IP держите **вне DHCP-пула** маршрутизатора либо зарезервируйте их там
+> static-lease по MAC точки — иначе DHCP может выдать тот же адрес другому клиенту
+> (классический симптом: `ping` адреса то отвечает, то нет, ARP «прыгает» между MAC).
 
 ---
 
